@@ -115,7 +115,8 @@ int asgn1_open(struct inode *inode, struct file *filp) {
    */
     if(atomic_read(&asgn1_device.nprocs) >= atomic_read(&asgn1_device.max_nprocs)) {
         printk(KERN_ERR "To many active processes\n");
-        return -EBUSY;
+        return -EBUSY;      
+
     }
 
     atomic_inc(&asgn1_device.nprocs);
@@ -130,7 +131,7 @@ int asgn1_open(struct inode *inode, struct file *filp) {
 /**
  * This function releases the virtual disk, but nothing needs to be done
  * in this case. 
- */
+ */      
 int asgn1_release (struct inode *inode, struct file *filp) {
   /**
    * decrement process count
@@ -280,10 +281,19 @@ long asgn1_ioctl (struct file *filp, unsigned cmd, unsigned long arg) {
 
         if(get_user(new_nprocs, (int*)&arg) < 0){
             printk(KERN_ERR "could not read users arg\n");
+            return -1;
         }
-    }
+        
+        if(atomic_read(&asgn1_device.nprocs) < new_nprocs || new_nprocs < 1){
+            printk(KERN_ERR "Invalid number for max_nprocs\n");
+            return -EINVAL;
+        }
 
-  return -ENOTTY;
+        atomic_set(&asgn1_device.max_nprocs, new_nprocs);
+        return 0;
+    }
+    printk(KERN_ERR "Invalid command:%d, this device only accepts cmd=%d", _IOC_TYPE(cmd), SET_NPROC_OP);
+    return -ENOTTY;
 }
 
 
@@ -303,6 +313,30 @@ static int asgn1_mmap (struct file *filp, struct vm_area_struct *vma)
      *   reached, add each page with remap_pfn_range one by one
      *   up to the last requested page
      */
+    if(offset > ramdisk_size || len + offset > ramdisk_size) {
+        printk(KERN_ERR "Provided address goes pass avaible device memory\n");
+        return -EAGAIN;
+    }else if(len % PAGE_SIZE != 0) {
+        printk(KERN_ERR "Length must be a factor of PAGE_SIZE\n");
+        return -EAGAIN;
+    }else if(offset % PAGE_SIZE != 0) {
+        printk(KERN_ERR "Offset must be a factor of PAGE_SIZE\n");
+        return -EAGAIN;
+    }
+
+    list_for_each_entry(curr, &asgn1_device.mem_list, list) {
+        if(index >= vma->vm_pgoff) {
+            pfn = page_to_pfn(curr->page);
+            if(remap_pfn_range(vma, vma->vm_start + (PAGE_SIZE*index), pfn, PAGE_SIZE, vma->vm_page_prot)) {
+                return -EAGAIN;
+            }
+        }
+
+        ++index;
+        if(len <= (PAGE_SIZE * (index - vma->vm_pgoff))) { // finished
+            return 0;
+        }
+    }
     return 0;
 }
 
@@ -383,6 +417,8 @@ int __init asgn1_init_module(void){
    * create proc entries
    */
     // allocate major number
+    atomic_set(&asgn1_device.nprocs, 0);
+    atomic_set(&asgn1_device.max_nprocs, 1);
     if(asgn1_major){
        // assgn static major number specified by user 
         if((register_chrdev_region(asgn1_device.dev, asgn1_dev_count, "Rico's Device")) < 0){
