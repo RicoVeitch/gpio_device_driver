@@ -159,7 +159,7 @@ ssize_t asgn1_read(struct file *filp, char __user *buf, size_t count,
 
     struct list_head *ptr = asgn1_device.mem_list.next;
     page_node *curr;
-    printk(KERN_INFO "read was called");
+    printk(KERN_INFO "read is called, request to write %i bytes\n", count);
   /**
    * check f_pos, if beyond data_size, return 0
    * 
@@ -176,7 +176,35 @@ ssize_t asgn1_read(struct file *filp, char __user *buf, size_t count,
    * if end of data area of ramdisk reached before copying the requested
    *   return the size copied to the user space so far
    */
+    if(*f_pos > asgn1_device.data_size) {
+        printk(KERN_ERR "File pointer out of range\n");
+        return -1;
+    }
 
+    if(count > asgn1_device.data_size) {
+        printk(KERN_WARNING "Read request excedes device memory\n");
+        count = asgn1_device.data_size;
+    }
+    
+    begin_offset = *f_pos % PAGE_SIZE;
+
+    list_for_each_entry(curr, ptr, list) {
+        if(curr_page_no >= begin_page_no) {
+            size_to_be_read = min((int)PAGE_SIZE - begin_offset, count - size_read);
+            do {
+                curr_size_read = copy_from_user(buf + size_read, page_address(curr->page), size_to_be_read);
+                size_read += curr_size_read;
+                size_to_be_read -= curr_size_read;
+                begin_offset += curr_size_read;
+            } while(size_to_be_read > 0);
+        }
+        if(count == size_read) {
+            break;
+        }
+        ++curr_page_no;
+    }
+    *f_pos += size_read;
+    printk(KERN_INFO "Read %d bytes", size_read);
     return size_read;
 }
 
@@ -201,11 +229,16 @@ static loff_t asgn1_lseek (struct file *file, loff_t offset, int cmd)
 
     switch(cmd){
         case SEEK_SET:
+            testpos = offset;
             break;
         case SEEK_CUR:
+            testpos = file->f_pos + offset;
             break;
         case SEEK_END:
+            testpos = asgn1_device.data_size + offset;
             break;
+        default:
+            return -EINVAL;
     }
 
     if(testpos > buffer_size) {
@@ -227,20 +260,20 @@ static loff_t asgn1_lseek (struct file *file, loff_t offset, int cmd)
  */
 ssize_t asgn1_write(struct file *filp, const char __user *buf, size_t count,
 		  loff_t *f_pos) {
-  size_t orig_f_pos = *f_pos;  /* the original file position */
-  size_t size_written = 0;  /* size written to virtual disk in this function */
-  size_t begin_offset;      /* the offset from the beginning of a page to
+    size_t orig_f_pos = *f_pos;  /* the original file position */
+    size_t size_written = 0;  /* size written to virtual disk in this function */
+    size_t begin_offset;      /* the offset from the beginning of a page to
 			       start writing */
-  int begin_page_no = *f_pos / PAGE_SIZE;  /* the first page this finction
+    int begin_page_no = *f_pos / PAGE_SIZE;  /* the first page this finction
 					      should start writing to */
 
-  int curr_page_no = 0;     /* the current page number */
-  size_t curr_size_written; /* size written to virtual disk in this round */
-  size_t size_to_be_written;  /* size to be read in the current round in 
+    int curr_page_no = 0;     /* the current page number */
+    size_t curr_size_written; /* size written to virtual disk in this round */
+    size_t size_to_be_written;  /* size to be read in the current round in 
 				 while loop */
   
-  struct list_head *ptr = asgn1_device.mem_list.next;
-  page_node *curr;
+    struct list_head *ptr = asgn1_device.mem_list.next;
+    page_node *curr;
     printk(KERN_INFO "Write was called\n");
   /**
    * Traverse the list until the first page reached, and add nodes if necessary
@@ -249,12 +282,49 @@ ssize_t asgn1_write(struct file *filp, const char __user *buf, size_t count,
    *   when copy_from_user() writes less than the amount you requested.
    *   a while loop / do-while loop is recommended to handle this situation. 
    */
+    begin_offset = *f_pos % PAGE_SIZE;
 
+    while(size_written < count) {
+        curr = list_entry(ptr, page_node, list);
+        
+        // Need to allocate more pages to the device, so add a page to the end.
+        if(ptr == &asgn1_device.mem_list) {
+            printk(KERN_INFO "Adding new page to device...\n");
+            if((curr = kmem_cache_alloc(asgn1_device.cache, GFP_KERNEL)) == NULL) {
+                printk(KERN_ERR "System has run out of memory\n");
+                return -1;
+            }
 
-  asgn1_device.data_size = max(asgn1_device.data_size,
+            if((curr->page = alloc_page(GFP_KERNEL)) == NULL) {
+                printk(KERN_ERR "System has run out of memory\n");
+                return -1;
+            }
+
+            list_add_tail(&curr->list, &asgn1_device.mem_list);
+            asgn1_device.num_pages++;
+            ptr = asgn1_device.mem_list.prev;
+            continue;
+        }else if(curr_page_no >= begin_page_no){
+            size_to_be_written = min((int)PAGE_SIZE - begin_offset, count - size_written); // remaining page or
+            printk(KERN_INFO "size to be written= %i", size_to_be_written);
+            do {
+                curr_size_written = copy_to_user(page_address(curr->page), buf + size_written, size_to_be_written);
+                size_written += curr_size_written;
+                size_to_be_written -= curr_size_written;
+                begin_offset += curr_size_written;
+            } while(size_to_be_written > 0);
+        }
+
+        ptr = ptr->next;
+        curr_page_no++;
+    }
+
+    *f_pos += size_written;
+    asgn1_device.data_size = max(asgn1_device.data_size,
                                orig_f_pos + size_written);
-  return size_written;
-}
+    printk(KERN_INFO "data_size= %i", asgn1_device.data_size);
+    return size_written;
+} 
 
 #define SET_NPROC_OP 1
 #define TEM_SET_NPROC _IOW(MYIOC_TYPE, SET_NPROC_OP, int) 
@@ -277,7 +347,9 @@ long asgn1_ioctl (struct file *filp, unsigned cmd, unsigned long arg) {
 
     if(_IOC_TYPE(cmd) != MYIOC_TYPE) return -EINVAL;
 
-    if(_IOC_TYPE(cmd) == SET_NPROC_OP){
+    nr = _IOC_NR(cmd);
+
+    if(nr == SET_NPROC_OP){
 
         if(get_user(new_nprocs, (int*)&arg) < 0){
             printk(KERN_ERR "could not read users arg\n");
@@ -323,7 +395,6 @@ static int asgn1_mmap (struct file *filp, struct vm_area_struct *vma)
         printk(KERN_ERR "Offset must be a factor of PAGE_SIZE\n");
         return -EAGAIN;
     }
-
     list_for_each_entry(curr, &asgn1_device.mem_list, list) {
         if(index >= vma->vm_pgoff) {
             pfn = page_to_pfn(curr->page);
@@ -353,29 +424,29 @@ struct file_operations asgn1_fops = {
 };
 
 
-static void *my_seq_start(struct seq_file *s, loff_t *pos)
-{
-if(*pos >= 1) return NULL;
-else return &asgn1_dev_count + *pos;
+static void *my_seq_start(struct seq_file *s, loff_t *pos) {
+    if(*pos >= 1) return NULL;
+    else return &asgn1_dev_count + *pos;
 }
-static void *my_seq_next(struct seq_file *s, void *v, loff_t *pos)
-{
-(*pos)++;
-if(*pos >= 1) return NULL;
-else return &asgn1_dev_count + *pos;
+
+
+static void *my_seq_next(struct seq_file *s, void *v, loff_t *pos) {
+    (*pos)++;
+    if(*pos >= 1) return NULL;
+    else return &asgn1_dev_count + *pos;
 }
-static void my_seq_stop(struct seq_file *s, void *v)
-{
-/* There's nothing to do here! */
+
+
+static void my_seq_stop(struct seq_file *s, void *v) {
+    /* There's nothing to do here! */
 }
+
 
 int my_seq_show(struct seq_file *s, void *v) {
   /**
    * use seq_printf to print some info to s
    */
   return 0;
-
-
 }
 
 
@@ -423,6 +494,7 @@ int __init asgn1_init_module(void){
        // assgn static major number specified by user 
         if((register_chrdev_region(asgn1_device.dev, asgn1_dev_count, "Rico's Device")) < 0){
             printk(KERN_INFO "Cannot allocate device with user specified major number=%i", asgn1_major);
+        //kfree(curr);
      
             // cant statically allocate must do it dynamically
             if ((alloc_chrdev_region(&asgn1_device.dev, asgn1_minor, asgn1_dev_count, "Rico's Device")) < 0){
@@ -456,9 +528,12 @@ int __init asgn1_init_module(void){
         goto ur_chrdev;
     }
 
+    // initialize the head of our list
+    INIT_LIST_HEAD(&asgn1_device.mem_list);
 
     // create cache
-    if((asgn1_device.cache = kmem_cache_create(CACHE_NAME, sizeof(page_node), 0, SLAB_HWCACHE_ALIGN, NULL)) == NULL){
+    if((asgn1_device.cache = kmem_cache_create(CACHE_NAME, sizeof(page_node), 0, 
+        SLAB_HWCACHE_ALIGN, NULL)) == NULL){
         printk(KERN_ERR "Cannot create cache for device\n");
         goto ur_chrdev; 
     }
