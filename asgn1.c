@@ -61,6 +61,8 @@ typedef struct asgn1_dev_t {
   struct kmem_cache *cache;      /* cache memory */
   struct class *class;     /* the udev class */
   struct device *device;   /* the udev device node */
+
+
 } asgn1_dev;
 
 asgn1_dev asgn1_device;
@@ -124,6 +126,8 @@ int asgn1_open(struct inode *inode, struct file *filp) {
         free_memory_pages();
     }
 
+    printk(KERN_ALERT "opening device=%s", MYDEV_NAME);
+
     return 0; /* success */
 }
 
@@ -159,7 +163,7 @@ ssize_t asgn1_read(struct file *filp, char __user *buf, size_t count,
 
     struct list_head *ptr = asgn1_device.mem_list.next;
     page_node *curr;
-    printk(KERN_INFO "read is called, request to write %i bytes\n", count);
+    printk(KERN_INFO "read is called, request to write %i bytes, start at page =%i\n", count, begin_page_no);
   /**
    * check f_pos, if beyond data_size, return 0
    * 
@@ -172,13 +176,14 @@ ssize_t asgn1_read(struct file *filp, char __user *buf, size_t count,
    *       unprocessed data, and the second and subsequent calls still
    *       need to check whether copy_to_user copies all data requested.
    *       This is best done by a while / do-while loop.
+                curr_size_written = copy_from_user(buf+size_written, page_address(curr->page), size_to_be_written);
    *
    * if end of data area of ramdisk reached before copying the requested
    *   return the size copied to the user space so far
    */
     if(*f_pos > asgn1_device.data_size) {
         printk(KERN_ERR "File pointer out of range\n");
-        return -1;
+        return 0;
     }
 
     if(count > asgn1_device.data_size) {
@@ -188,11 +193,17 @@ ssize_t asgn1_read(struct file *filp, char __user *buf, size_t count,
     
     begin_offset = *f_pos % PAGE_SIZE;
 
-    list_for_each_entry(curr, ptr, list) {
+    list_for_each_entry(curr, &(asgn1_device.mem_list), list) {
         if(curr_page_no >= begin_page_no) {
             size_to_be_read = min((int)PAGE_SIZE - begin_offset, count - size_read);
+            printk(KERN_INFO "size to be read =%i\n", size_to_be_read);
             do {
-                curr_size_read = copy_from_user(buf + size_read, page_address(curr->page), size_to_be_read);
+                /*size_to_be_read = min((int)PAGE_SIZE - begin_offset, count - size_read);
+                printk(KERN_INFO "size to be read =%i, begin offset=%i\n", size_to_be_read, begin_offset);*/
+
+                curr_size_read = size_to_be_read - copy_to_user(buf + size_read, page_address(curr->page) + begin_offset, 
+                                    size_to_be_read);
+                printk(KERN_ALERT "curr size read=%i", curr_size_read);
                 size_read += curr_size_read;
                 size_to_be_read -= curr_size_read;
                 begin_offset += curr_size_read;
@@ -274,7 +285,9 @@ ssize_t asgn1_write(struct file *filp, const char __user *buf, size_t count,
   
     struct list_head *ptr = asgn1_device.mem_list.next;
     page_node *curr;
-    printk(KERN_INFO "Write was called\n");
+    int stuck = 0;
+    int looped = 0;
+    printk(KERN_INFO "Write was called, begin=%i\n", begin_page_no);
   /**
    * Traverse the list until the first page reached, and add nodes if necessary
    *
@@ -282,14 +295,18 @@ ssize_t asgn1_write(struct file *filp, const char __user *buf, size_t count,
    *   when copy_from_user() writes less than the amount you requested.
    *   a while loop / do-while loop is recommended to handle this situation. 
    */
+    if(orig_f_pos > asgn1_device.data_size) {
+        printk(KERN_ERR "Trying to access beyond device boundary\n");
+    }
+
     begin_offset = *f_pos % PAGE_SIZE;
 
     while(size_written < count) {
         curr = list_entry(ptr, page_node, list);
         
         // Need to allocate more pages to the device, so add a page to the end.
-        if(ptr == &asgn1_device.mem_list) {
-            printk(KERN_INFO "Adding new page to device...\n");
+        if(ptr == &(asgn1_device.mem_list)) {
+            printk(KERN_ALERT "Adding new page to device...\n");
             if((curr = kmem_cache_alloc(asgn1_device.cache, GFP_KERNEL)) == NULL) {
                 printk(KERN_ERR "System has run out of memory\n");
                 return -1;
@@ -299,30 +316,33 @@ ssize_t asgn1_write(struct file *filp, const char __user *buf, size_t count,
                 printk(KERN_ERR "System has run out of memory\n");
                 return -1;
             }
-
-            list_add_tail(&curr->list, &asgn1_device.mem_list);
+            //INIT_LIST_HEAD(&(curr->list));
+            list_add_tail(&(curr->list), &(asgn1_device.mem_list));
+            printk(KERN_ALERT  "added to tail\n");
             asgn1_device.num_pages++;
             ptr = asgn1_device.mem_list.prev;
             continue;
-        }else if(curr_page_no >= begin_page_no){
+        } else if(curr_page_no >= begin_page_no) {
             size_to_be_written = min((int)PAGE_SIZE - begin_offset, count - size_written); // remaining page or
-            printk(KERN_INFO "size to be written= %i", size_to_be_written);
+            printk(KERN_ALERT "(start) size to be written= %i, begin offset=%i, curr page=%i", size_to_be_written, begin_offset, curr_page_no);
             do {
-                curr_size_written = copy_to_user(page_address(curr->page), buf + size_written, size_to_be_written);
+                curr_size_written = size_to_be_written - copy_from_user(page_address(curr->page) + begin_offset, 
+                    buf + size_written, size_to_be_written);
                 size_written += curr_size_written;
                 size_to_be_written -= curr_size_written;
                 begin_offset += curr_size_written;
-            } while(size_to_be_written > 0);
+            } while(size_to_be_written > 0); // curr_size_written < size_to_be_written)
+            begin_offset = 0;
         }
-
-        ptr = ptr->next;
         curr_page_no++;
+        ptr = ptr->next;
+        
     }
-
+ 
     *f_pos += size_written;
     asgn1_device.data_size = max(asgn1_device.data_size,
                                orig_f_pos + size_written);
-    printk(KERN_INFO "data_size= %i", asgn1_device.data_size);
+    printk(KERN_ALERT "data_size= %i", asgn1_device.data_size);
     return size_written;
 } 
 
@@ -529,11 +549,11 @@ int __init asgn1_init_module(void){
     }
 
     // initialize the head of our list
-    INIT_LIST_HEAD(&asgn1_device.mem_list);
+    INIT_LIST_HEAD(&(asgn1_device.mem_list));
 
     // create cache
     if((asgn1_device.cache = kmem_cache_create(CACHE_NAME, sizeof(page_node), 0, 
-        SLAB_HWCACHE_ALIGN, NULL)) == NULL){
+        0, NULL)) == NULL) { //SLAB_HWCACHE_ALIGN,
         printk(KERN_ERR "Cannot create cache for device\n");
         goto ur_chrdev; 
     }
@@ -603,5 +623,9 @@ void __exit asgn1_exit_module(void){
 
 module_init(asgn1_init_module);
 module_exit(asgn1_exit_module);
+
+
+
+
 
 
