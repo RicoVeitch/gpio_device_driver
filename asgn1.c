@@ -115,14 +115,14 @@ int asgn1_open(struct inode *inode, struct file *filp) {
    * if opened in write-only mode, free all memory pages
    *
    */
-    if(atomic_read(&asgn1_device.nprocs) >= atomic_read(&asgn1_device.max_nprocs)) {
+    if(atomic_read(&asgn1_device.nprocs) > atomic_read(&asgn1_device.max_nprocs)) {
         printk(KERN_ERR "To many active processes\n");
         return -EBUSY;      
 
     }
 
     atomic_inc(&asgn1_device.nprocs);
-    if(filp->f_mode == FMODE_WRITE) {
+    if((filp->f_flags == O_ACCMODE) == O_WRONLY) {
         free_memory_pages();
     }
 
@@ -195,15 +195,15 @@ ssize_t asgn1_read(struct file *filp, char __user *buf, size_t count,
 
     list_for_each_entry(curr, &(asgn1_device.mem_list), list) {
         if(curr_page_no >= begin_page_no) {
-            size_to_be_read = min((int)PAGE_SIZE - begin_offset, count - size_read);
-            printk(KERN_INFO "size to be read =%i\n", size_to_be_read);
+            //size_to_be_read = min((int)PAGE_SIZE - begin_offset, count - size_read);
+            //printk(KERN_INFO "size to be read =%i\n", size_to_be_read);
             do {
-                /*size_to_be_read = min((int)PAGE_SIZE - begin_offset, count - size_read);
-                printk(KERN_INFO "size to be read =%i, begin offset=%i\n", size_to_be_read, begin_offset);*/
+                size_to_be_read = min((int)PAGE_SIZE - begin_offset, count - size_read);
+                /*printk(KERN_INFO "size to be read =%i, begin offset=%i\n", size_to_be_read, begin_offset);*/
 
                 curr_size_read = size_to_be_read - copy_to_user(buf + size_read, page_address(curr->page) + begin_offset, 
                                     size_to_be_read);
-                printk(KERN_ALERT "curr size read=%i", curr_size_read);
+                //printk(KERN_ALERT "curr size read=%i", curr_size_read);
                 size_read += curr_size_read;
                 size_to_be_read -= curr_size_read;
                 begin_offset += curr_size_read;
@@ -238,7 +238,7 @@ static loff_t asgn1_lseek (struct file *file, loff_t offset, int cmd)
      * set file->f_pos to testpos
      */
 
-    switch(cmd){
+    switch(cmd) {
         case SEEK_SET:
             testpos = offset;
             break;
@@ -316,18 +316,18 @@ ssize_t asgn1_write(struct file *filp, const char __user *buf, size_t count,
                 printk(KERN_ERR "System has run out of memory\n");
                 return -1;
             }
-            //INIT_LIST_HEAD(&(curr->list));
             list_add_tail(&(curr->list), &(asgn1_device.mem_list));
             printk(KERN_ALERT  "added to tail\n");
             asgn1_device.num_pages++;
             ptr = asgn1_device.mem_list.prev;
             continue;
         } else if(curr_page_no >= begin_page_no) {
-            size_to_be_written = min((int)PAGE_SIZE - begin_offset, count - size_written); // remaining page or
-            printk(KERN_ALERT "(start) size to be written= %i, begin offset=%i, curr page=%i", size_to_be_written, begin_offset, curr_page_no);
+            //size_to_be_written = min((int)PAGE_SIZE - begin_offset, count - size_written); // remaining page or
             do {
+                size_to_be_written = min((int)PAGE_SIZE - begin_offset, count - size_written); // remaining page or
                 curr_size_written = size_to_be_written - copy_from_user(page_address(curr->page) + begin_offset, 
                     buf + size_written, size_to_be_written);
+                printk(KERN_ALERT "curr_size_written=%i\n", curr_size_written);
                 size_written += curr_size_written;
                 size_to_be_written -= curr_size_written;
                 begin_offset += curr_size_written;
@@ -371,14 +371,15 @@ long asgn1_ioctl (struct file *filp, unsigned cmd, unsigned long arg) {
 
     if(nr == SET_NPROC_OP){
 
-        if(get_user(new_nprocs, (int*)&arg) < 0){
+        if(get_user(new_nprocs, (int*)arg) != 0){
             printk(KERN_ERR "could not read users arg\n");
-            return -1;
+            return -EFAULT;
         }
         
-        if(atomic_read(&asgn1_device.nprocs) < new_nprocs || new_nprocs < 1){
-            printk(KERN_ERR "Invalid number for max_nprocs\n");
-            return -EINVAL;
+        if(atomic_read(&asgn1_device.nprocs) > new_nprocs || new_nprocs < 1){
+            printk(KERN_ERR "Invalid number for max_nprocs, current=%i, requested=%i\n", 
+                    atomic_read(&asgn1_device.nprocs), new_nprocs);
+             return -EINVAL;
         }
 
         atomic_set(&asgn1_device.max_nprocs, new_nprocs);
@@ -415,7 +416,7 @@ static int asgn1_mmap (struct file *filp, struct vm_area_struct *vma)
         printk(KERN_ERR "Offset must be a factor of PAGE_SIZE\n");
         return -EAGAIN;
     }
-    list_for_each_entry(curr, &asgn1_device.mem_list, list) {
+    list_for_each_entry(curr, &(asgn1_device.mem_list), list) {
         if(index >= vma->vm_pgoff) {
             pfn = page_to_pfn(curr->page);
             if(remap_pfn_range(vma, vma->vm_start + (PAGE_SIZE*index), pfn, PAGE_SIZE, vma->vm_page_prot)) {
@@ -512,12 +513,12 @@ int __init asgn1_init_module(void){
     atomic_set(&asgn1_device.max_nprocs, 1);
     if(asgn1_major){
        // assgn static major number specified by user 
-        if((register_chrdev_region(asgn1_device.dev, asgn1_dev_count, "Rico's Device")) < 0){
+        if((register_chrdev_region(asgn1_device.dev, asgn1_dev_count, "Rico's Device")) < 0) {
             printk(KERN_INFO "Cannot allocate device with user specified major number=%i", asgn1_major);
         //kfree(curr);
      
             // cant statically allocate must do it dynamically
-            if ((alloc_chrdev_region(&asgn1_device.dev, asgn1_minor, asgn1_dev_count, "Rico's Device")) < 0){
+            if ((alloc_chrdev_region(&asgn1_device.dev, asgn1_minor, asgn1_dev_count, "Rico's Device")) < 0) {
                 printk(KERN_INFO "Cannot allocate char device");
                 return -1;
             }
@@ -526,7 +527,7 @@ int __init asgn1_init_module(void){
         }
     }else{
         // user did not specify major number, do it dynamically
-         if((alloc_chrdev_region(&asgn1_device.dev, asgn1_minor, asgn1_dev_count, "Rico's Device")) < 0){
+         if((alloc_chrdev_region(&asgn1_device.dev, asgn1_minor, asgn1_dev_count, "Rico's Device")) < 0) {
             printk(KERN_INFO "Cannot allocate char device");
             return -1;
         }
@@ -535,7 +536,7 @@ int __init asgn1_init_module(void){
     printk(KERN_INFO "Successfuly allocated major number=%i for device", asgn1_major);
 
     // allocate cdev
-    if((asgn1_device.cdev = cdev_alloc()) == NULL){
+    if((asgn1_device.cdev = cdev_alloc()) == NULL) {
         printk(KERN_ERR "Unable to allocate cdev\n");
         goto ur_chrdev;
     }   
@@ -543,7 +544,7 @@ int __init asgn1_init_module(void){
     cdev_init(asgn1_device.cdev, &asgn1_fops); 
     asgn1_device.cdev->owner = THIS_MODULE; // set owner feild    
     // add cdev    
-    if((cdev_add(asgn1_device.cdev, asgn1_device.dev, asgn1_dev_count)) < 0){
+    if((cdev_add(asgn1_device.cdev, asgn1_device.dev, asgn1_dev_count)) < 0) {
         printk(KERN_ERR "Cannot add device to system\n");
         goto ur_chrdev;
     }
@@ -577,9 +578,9 @@ int __init asgn1_init_module(void){
     
     proc_create(PROC_NAME, 666, NULL, &asgn1_proc_ops);
   
-  printk(KERN_WARNING "set up udev entry\n");
-  printk(KERN_WARNING "Hello world from %s\n", MYDEV_NAME);
-  return 0;
+    printk(KERN_WARNING "set up udev entry\n");
+    printk(KERN_WARNING "Hello world from %s\n", MYDEV_NAME);
+    return 0;
 
 
 ur_chrdev:
