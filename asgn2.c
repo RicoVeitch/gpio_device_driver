@@ -31,7 +31,7 @@
 #include <linux/seq_file.h>
 #include <linux/device.h>
 #include <linux/sched.h>
-
+#include <linux/sched/signal.h>
 #include "gpio.h"
 
 #define MYDEV_NAME "asgn2"
@@ -84,12 +84,12 @@ circular_buffer cb;
 
 typedef struct sessions_t {
     int *ends;
-    int curr_session;
-    int total_sessions;
+    int count;
+    atomic_t curr;
 
 } Sessions;
 
-Session session;
+Sessions sessions;
 
 int asgn2_major = 0;                      /* major number of module */  
 int asgn2_minor = 0;                      /* minor number of module */
@@ -97,7 +97,6 @@ int asgn2_dev_count = 1;                  /* number of devices */
 
 int is_sig = 1;
 char curr_sig;
-
 module_param(asgn2_major, int, S_IWUSR|S_IRUSR);
 
 /**
@@ -169,6 +168,8 @@ int asgn2_release (struct inode *inode, struct file *filp) {
 }
 
 
+DECLARE_WAIT_QUEUE_HEAD(consumers_wq);
+DEFINE_MUTEX(read_lock);
 /**
  * This function reads contents of the virtual disk and writes to the user 
  */
@@ -184,23 +185,48 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 
     size_t size_to_be_read;   /* size to be read in the current round in 
                        while loop */
-
+    int sess_num;
     //struct list_head *ptr = asgn2_device.mem_list.next;
     page_node *curr;
-    printk(KERN_INFO "read is called, request to write %i bytes, start at page =%i\n", count, begin_page_no);
 
     if(*f_pos > asgn2_device.data_size) {
         printk(KERN_ERR "File pointer out of range\n");
+        //mutex_unlock(&read_lock);
         return 0;
     }
+
+    wait_event_interruptible_exclusive(consumers_wq, sessions.count > atomic_read(&sessions.curr));
+    if(signal_pending(current)) {
+        return -ERESTARTSYS;
+    }
+
+    atomic_inc(&sessions.curr);
+
+    if(mutex_lock_interruptible(&read_lock)) {
+        printk(KERN_INFO "mutex unlocked by signal\n");
+        mutex_unlock(&read_lock);
+        return -EINTR;
+    } // returns -EINTR if get signal
+
+    sess_num = atomic_read(&sessions.curr) - 1;
+    printk(KERN_INFO "read is called, request to write %i bytes, start at page =%i, sess_num=%i, fpos=%llu\n", 
+        count, begin_page_no, sess_num, *f_pos);
+
+
 
     if(count > asgn2_device.data_size) {
         printk(KERN_WARNING "Read request excedes device memory\n");
         count = asgn2_device.data_size;
     }
     
+        if(sess_num != 0) {
+        *f_pos = sessions.ends[sess_num-1];
+    }
+
+    count = sessions.ends[sess_num] - *f_pos; 
     begin_offset = *f_pos % PAGE_SIZE;
-    printk(KERN_ALERT "begin_offset=%i\n", begin_offset);
+
+    printk(KERN_ALERT "begin_offset=%i, count=%i\n", begin_offset, count);
     /*Loop through each page till we hit our first disired page. The size we want to read
       in a given iteration is the minium of the remainig (curr) page, and the total amount left to read.
       Check to se if we have failed to read (size_to_be_read) amount, if so keep going.*/
@@ -218,14 +244,17 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
             } while(size_to_be_read > 0);
             begin_offset = 0;
         }
-        if(count <= size_read) {
+        if(count == size_read) {
             printk(KERN_ALERT "size_read=%i", size_read);
             break;
         }
+        printk(KERN_ALERT "page=%i", curr_page_no);
+
         ++curr_page_no;
     }
-    *f_pos += size_read;
-    printk(KERN_INFO "Read %d bytes", size_read);
+    *f_pos += size_read + 1;
+    printk(KERN_ALERT "Read %d bytes", size_read);
+    mutex_unlock(&read_lock);
     return size_read;
 }
 
@@ -238,7 +267,7 @@ void cb_write(char data) {
         cb.count++;
     }
     cb.buffer[cb.head] = data;
-    printk(KERN_INFO "Inserted %c into buf, head=%i, tail=%i, count=%i", data, cb.head, cb.tail, cb.count);
+    //printk(KERN_INFO "Inserted %c into buf, head=%i, tail=%i, count=%i", data, cb.head, cb.tail, cb.count);
 }
 
 char cb_read(void) {
@@ -254,7 +283,7 @@ int cb_empty(void) {
 }
 
 
-void asgn2_write(unsigned long data) {
+void asgn2_write(unsigned long pass) {
     size_t begin_offset; 
     struct list_head *ptr = asgn2_device.mem_list.next;
     char to_write;
@@ -263,6 +292,21 @@ void asgn2_write(unsigned long data) {
     
     printk(KERN_INFO "write called");
     while (!cb_empty()) {
+        to_write = cb_read();
+        
+        if(to_write == '\0') {
+            /* update sessions */
+            sessions.count++;
+            if(sessions.count == 1) {
+                sessions.ends = kmalloc(sizeof(int), GFP_KERNEL);
+            } else {
+                sessions.ends = krealloc(sessions.ends, sizeof(int) * sessions.count, GFP_KERNEL);
+            }
+            sessions.ends[sessions.count-1] = asgn2_device.data_size; // mark end of the session.
+            wake_up_interruptible(&consumers_wq); // completed a session, notify a consumer.
+            continue;
+        }
+
         begin_offset = asgn2_device.data_size % PAGE_SIZE; 
 
         curr = list_entry(ptr, page_node, list);
@@ -283,28 +327,21 @@ void asgn2_write(unsigned long data) {
             ptr = asgn2_device.mem_list.prev;
         }
         
-        to_write = cb_read();
         memcpy(page_address(curr->page) + begin_offset, &to_write, 1);
-        printk(KERN_INFO "wrote %c to page list", to_write);
         asgn2_device.data_size += sizeof(to_write);
+        printk(KERN_INFO "wrote %c to page list, data_size=%i", to_write, asgn2_device.data_size);
+
     }
     
 }
 
-
-void print_bin(char c) {
-    int i;
-    for(i = 0; i < 8; i++) {
-        printk(KERN_INFO "%d\n", !!((c << i) & 0x80));
-    }
-}
 
 DECLARE_TASKLET(tasklet, asgn2_write, 1);
 irqreturn_t dummyport_interrupt(int irq, void *dev_id) {
     char data;
     char res;
     data = read_half_byte();
-    printk(KERN_INFO "interupt made\n");
+    //printk(KERN_INFO "interupt made\n");
     //print_bin(data);
 
     if(is_sig) {
@@ -313,7 +350,7 @@ irqreturn_t dummyport_interrupt(int irq, void *dev_id) {
     } else {
         res = (curr_sig << 4) | data;
         cb_write(res);
-        printk(KERN_INFO "combined bit=%c", res);
+        //printk(KERN_INFO "combined bit=%c", res);
         is_sig = 1;
     }
 
