@@ -1,4 +1,4 @@
 #!/bin/bash
 make
-sudo rmmod asgn2
-sudo insmod asgn2.ko
+sudo rmmod gpio_device
+sudo insmod gpio_device.ko
