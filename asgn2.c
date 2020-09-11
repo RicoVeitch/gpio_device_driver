@@ -95,8 +95,8 @@ int asgn2_major = 0;                      /* major number of module */
 int asgn2_minor = 0;                      /* minor number of module */
 int asgn2_dev_count = 1;                  /* number of devices */
 
-int is_sig = 1;
-char curr_sig;
+int is_sig = 1; // indicate whether the next bit to read is the most significant or not.
+char curr_sig; // stores the current significant half byte.
 module_param(asgn2_major, int, S_IWUSR|S_IRUSR);
 
 /**
@@ -129,12 +129,8 @@ void free_memory_pages(void) {
 
 }
 
-
-/**
- * This function opens the virtual disk, if it is opened in the write-only
- * mode, all memory pages will be freed.
- */
-DECLARE_WAIT_QUEUE_HEAD(open_wq);
+/*This function opens the virtual disk in read only mode.*/
+DECLARE_WAIT_QUEUE_HEAD(open_wq); // wait queue to hold processes waiting to open device.
 int asgn2_open(struct inode *inode, struct file *filp) {
    
     // Make sure its read only
@@ -155,22 +151,18 @@ int asgn2_open(struct inode *inode, struct file *filp) {
 
 
 /**
- * This function releases the virtual disk, but nothing needs to be done
- * in this case. 
- */      
+ * This function releases the virtual disk and wakes up any processes that are waiting in the queue.*/      
 int asgn2_release (struct inode *inode, struct file *filp) {
-  /**
-   * decrement process count, and wake up any process.
-   */
     atomic_dec(&asgn2_device.nprocs);
+    printk(KERN_INFO "releasing.. waking up queue.\n");
     wake_up_interruptible(&open_wq); 
     return 0;
 }
 
 
-DECLARE_WAIT_QUEUE_HEAD(consumers_wq);
-DEFINE_MUTEX(read_lock);
-DEFINE_MUTEX(page_lock);
+DECLARE_WAIT_QUEUE_HEAD(consumers_wq); // wait queue to hold all the consumers waiting to read from the device.
+DEFINE_MUTEX(read_lock); // read lock to unsure there is only one process reading at a time.
+DEFINE_MUTEX(page_lock); // page lock to protect concurrency issues between readers and iterrupt handler.
 /**
  * This function reads contents of the virtual disk and writes to the user 
  */
@@ -211,8 +203,6 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
         return -ERESTARTSYS;
     }
 
-    //atomic_inc(&sessions.done);
-  
     if(count > asgn2_device.data_size) {
         printk(KERN_WARNING "Read request excedes device memory\n");
         count = asgn2_device.data_size;
@@ -246,6 +236,8 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
                 curr_size_read = size_to_be_read - copy_to_user(buf + size_read, page_address(curr->page) + begin_offset, 
                                     size_to_be_read);
                 
+                /*If we reach the end of the page, obtain the page lock, then free it.
+                  Update varaibles accordingly.*/
                 if(curr_size_read + begin_offset == PAGE_SIZE) {
                     if(mutex_lock_interruptible(&page_lock)) {
                         printk(KERN_INFO "page mutex unlocked by signal\n");
@@ -258,7 +250,7 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
                     kmem_cache_free(asgn2_device.cache, curr); 
                     
                     asgn2_device.data_size -= PAGE_SIZE;
-                    asgn2_device.num_pages++;
+                    asgn2_device.num_pages--;
                     begin_offset -= PAGE_SIZE;
                     for(i = sessions.done; i < sessions.count; i++) {
                         sessions.ends[i] -= PAGE_SIZE;
@@ -329,6 +321,7 @@ void asgn2_write(unsigned long pass) {
         begin_offset = asgn2_device.data_size % PAGE_SIZE; 
 
         curr = list_entry(ptr, page_node, list);
+        /*Add a page.*/
         if(begin_offset == 0) { //ptr == &(asgn2_device.mem_list)
             printk(KERN_ALERT "Adding new page to device, deta_size=%i\n", asgn2_device.data_size);
             if((curr = kmem_cache_alloc(asgn2_device.cache, GFP_KERNEL)) == NULL) {
@@ -375,104 +368,18 @@ irqreturn_t dummyport_interrupt(int irq, void *dev_id) {
     char data;
     char res;
     data = read_half_byte();
-    //printk(KERN_INFO "interupt made\n");
-    //print_bin(data);
-
     if(is_sig) {
         curr_sig = data;
         is_sig = 0;
     } else {
         res = (curr_sig << 4) | data;
         cb_write(res);
-        //printk(KERN_INFO "combined bit=%c", res);
         is_sig = 1;
     }
 
     tasklet_schedule(&tasklet);
     return IRQ_HANDLED; 
 }
-
-/**
- * This function writes from the user buffer to the virtual disk of this
- * module
- */
-/*ssize_t asgn2_write(struct file *filp, const char __user *buf, size_t count,
-		  loff_t *f_pos) {
-    size_t orig_f_pos = *f_pos;  //the original file position
-    size_t size_written = 0;  // size written to virtual disk in this function
-    size_t begin_offset;      // the offset from the beginning of a page to start writing
-    int begin_page_no = *f_pos / PAGE_SIZE;  // the first page this finction
-					      //should start writing to 
-
-    int curr_page_no = 0;     the current page number 
-    size_t curr_size_written;  size written to virtual disk in this round 
-    size_t size_to_be_written;  // size to be read in the current round in 
-				 //while loop 
-  
-    struct list_head *ptr = asgn2_device.mem_list.next;
-    page_node *curr;
-    
-    printk(KERN_INFO "Write was called, begin=%i\n", begin_page_no);
-
-    if(orig_f_pos > asgn2_device.data_size) {
-        printk(KERN_ERR "Trying to access beyond device boundary\n");
-    }
-
-    begin_offset = *f_pos % PAGE_SIZE;
-
-    //As we could be adding pages on the fly, it is sensible not to avoid having the outer loop
-      //iterating over each entry. Instead just check if we still have more to read and then
-      //get the curr page entry accordinly.
-
-    while(size_written < count) {
-        curr = list_entry(ptr, page_node, list);
-        
-       // We either currently have no pages, or we have have run out. 
-            //Anycase we need to allocate more pages to the device, so add a page to the tail of the list.
-            
-        if(ptr == &(asgn2_device.mem_list)) {
-            printk(KERN_ALERT "Adding new page to device...\n");
-            if((curr = kmem_cache_alloc(asgn2_device.cache, GFP_KERNEL)) == NULL) {
-                printk(KERN_ERR "System has run out of memory\n");
-                return -1;
-            }
-
-            if((curr->page = alloc_page(GFP_KERNEL)) == NULL) {
-                printk(KERN_ERR "System has run out of memory\n");
-                return -1;
-            }
-            list_add_tail(&(curr->list), &(asgn2_device.mem_list));
-            printk(KERN_ALERT  "added to tail\n");
-            asgn2_device.num_pages++;
-            ptr = asgn2_device.mem_list.prev;
-            continue;
-        } else if(curr_page_no >= begin_page_no) {
-            //size_to_be_written = min((int)PAGE_SIZE - begin_offset, count - size_written); // remaining page or
-            do {
-                size_to_be_written = min((int)PAGE_SIZE - begin_offset, count - size_written); // remaining page or
-                curr_size_written = size_to_be_written - copy_from_user(page_address(curr->page) + begin_offset, 
-                    buf + size_written, size_to_be_written);
-                printk(KERN_ALERT "curr_size_written=%i\n", curr_size_written);
-                size_written += curr_size_written;
-                size_to_be_written -= curr_size_written;
-                begin_offset += curr_size_written;
-            } while(size_to_be_written > 0); // sizetoebwritten > 0
-             //if we still have more pages to write, we want to resest to the offset to the 
-                //beggining of the next page
-            begin_offset = 0; 
-        }
-        // move along
-        curr_page_no++;
-        ptr = ptr->next;
-        
-    }
- 
-    *f_pos += size_written;
-    asgn2_device.data_size = max(asgn2_device.data_size,
-                               orig_f_pos + size_written);
-    printk(KERN_ALERT "data_size= %i", asgn2_device.data_size);
-    return size_written;
-} */
 
 #define SET_NPROC_OP 1
 #define TEM_SET_NPROC _IOW(MYIOC_TYPE, SET_NPROC_OP, int) 
