@@ -1,13 +1,13 @@
 
 /**
  * File: asgn2.c
- * Date: 13/03/2011
- * Author: Rico Veitch 
- * Version: 0.1
+ * Date: 09/04/2020
+ * Author: Rico Veitch
+ * Version: 1.0 
  *
  * This is a module which serves as a virtual ramdisk which disk size is
  * limited by the amount of memory available and serves as the requirement for
- * COSC440 assignment 1 in 2012.
+ * COSC440 assignment 2 in 2020.
  *
  * Note: multiple devices and concurrent modules are not supported in this
  *       version.
@@ -32,6 +32,7 @@
 #include <linux/device.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
+
 #include "gpio.h"
 
 #define MYDEV_NAME "asgn2"
@@ -69,9 +70,6 @@ typedef struct asgn2_dev_t {
 
 } asgn2_dev;
 
-asgn2_dev asgn2_device;
-
-
 typedef struct circular_buffer_t {
     char buffer[BUF_SIZE];
     int head;
@@ -80,16 +78,16 @@ typedef struct circular_buffer_t {
 
 } circular_buffer;
 
-circular_buffer cb;
-
 typedef struct sessions_t {
     int *ends;
     int count;
     int done;
 
-} Sessions;
+} sessions_rec;
 
-Sessions sessions;
+asgn2_dev asgn2_device;
+circular_buffer cb;
+sessions_rec sessions;
 
 int asgn2_major = 0;                      /* major number of module */  
 int asgn2_minor = 0;                      /* minor number of module */
@@ -103,17 +101,6 @@ module_param(asgn2_major, int, S_IWUSR|S_IRUSR);
  * This function frees all memory pages held by the module.
  */
 void free_memory_pages(void) {
-
-  /**
-   * Loop through the entire page list {
-   *   if (node has a page) {
-   *     free the page
-   *   }
-   *   remove the node from the page list
-   *   free the node
-   * }
-   * reset device data size, and num_pages
-   */
     page_node *curr;
     page_node *temp;
 
@@ -162,7 +149,8 @@ int asgn2_release (struct inode *inode, struct file *filp) {
 
 DECLARE_WAIT_QUEUE_HEAD(consumers_wq); // wait queue to hold all the consumers waiting to read from the device.
 DEFINE_MUTEX(read_lock); // read lock to unsure there is only one process reading at a time.
-DEFINE_MUTEX(page_lock); // page lock to protect concurrency issues between readers and iterrupt handler.
+DEFINE_SPINLOCK(page_lock); // page lock to protect concurrency issues between readers and iterrupt handler.
+
 /**
  * This function reads contents of the virtual disk and writes to the user 
  */
@@ -239,11 +227,12 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
                 /*If we reach the end of the page, obtain the page lock, then free it.
                   Update varaibles accordingly.*/
                 if(curr_size_read + begin_offset == PAGE_SIZE) {
-                    if(mutex_lock_interruptible(&page_lock)) {
+                    /*if(mutex_lock_interruptible(&page_lock)) {
                         printk(KERN_INFO "page mutex unlocked by signal\n");
                         mutex_unlock(&page_lock);
                         return -EINTR;
-                    } 
+                    } */
+                    spin_lock(&page_lock);
                     printk(KERN_INFO "freeing page.\n");
                     __free_page(curr->page);
                     list_del(&curr->list);
@@ -255,7 +244,8 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
                     for(i = sessions.done; i < sessions.count; i++) {
                         sessions.ends[i] -= PAGE_SIZE;
                     }
-                    mutex_unlock(&page_lock);
+                    //mutex_unlock(&page_lock);
+                    spin_unlock(&page_lock);
                 }
                 
                 size_read += curr_size_read;
@@ -280,21 +270,20 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 }
 
 void cb_write(char data) {
+    cb.buffer[cb.head] = data;
     cb.head = (cb.head + 1) % BUF_SIZE;
 
     if(cb.count == BUF_SIZE) {
        cb.tail = (cb.tail + 1) % BUF_SIZE; 
     } else {
         cb.count++;
-    }
-    cb.buffer[cb.head] = data;
-    //printk(KERN_INFO "Inserted %c into buf, head=%i, tail=%i, count=%i", data, cb.head, cb.tail, cb.count);
+    }    
 }
 
 char cb_read(void) {
     char res;
-    res = cb.buffer[cb.head];
-    cb.head = (cb.head + 1) % BUF_SIZE;
+    res = cb.buffer[cb.tail];
+    cb.tail = (cb.tail + 1) % BUF_SIZE;
     cb.count--;
     return res;
 }
@@ -313,11 +302,12 @@ void asgn2_write(unsigned long pass) {
     
     while (!cb_empty()) {
         to_write = cb_read();
-        if(mutex_lock_interruptible(&page_lock)) {
+        /*if(mutex_lock_interruptible(&page_lock)) {
             printk(KERN_INFO "page mutex unlocked by signal\n");
             mutex_unlock(&page_lock);
             return;
-        } 
+        } */
+        spin_lock(&page_lock);
         begin_offset = asgn2_device.data_size % PAGE_SIZE; 
 
         curr = list_entry(ptr, page_node, list);
@@ -342,7 +332,8 @@ void asgn2_write(unsigned long pass) {
         memcpy(page_address(curr->page) + begin_offset, &to_write, 1);
         asgn2_device.data_size += sizeof(to_write);
 
-        mutex_unlock(&page_lock);
+        //mutex_unlock(&page_lock);
+        spin_unlock(&page_lock);
 
         if(to_write == '\0') {
             /* update sessions */
