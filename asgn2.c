@@ -85,7 +85,7 @@ circular_buffer cb;
 typedef struct sessions_t {
     int *ends;
     int count;
-    atomic_t curr;
+    int done;
 
 } Sessions;
 
@@ -134,23 +134,22 @@ void free_memory_pages(void) {
  * This function opens the virtual disk, if it is opened in the write-only
  * mode, all memory pages will be freed.
  */
+DECLARE_WAIT_QUEUE_HEAD(open_wq);
 int asgn2_open(struct inode *inode, struct file *filp) {
-
-    if(atomic_read(&asgn2_device.nprocs) > atomic_read(&asgn2_device.max_nprocs)) {
-        printk(KERN_ALERT "To many active processes\n");
-        return -EBUSY;      
-
+   
+    // Make sure its read only
+    if((filp->f_flags & O_ACCMODE) != O_RDONLY) {
+        return -EACCES; // request denied
     }
 
+    wait_event_interruptible_exclusive(open_wq, atomic_read(&asgn2_device.nprocs) < atomic_read(&asgn2_device.max_nprocs)); 
+    if(signal_pending(current)) {
+        printk(KERN_WARNING "consumer wait queue interrupted by system.\n");
+        return -ERESTARTSYS;
+    }
     atomic_inc(&asgn2_device.nprocs);
-    // if open in write only, clear all pages
-    if((filp->f_flags & O_ACCMODE) == O_WRONLY) {
-        printk(KERN_ALERT "Freeing memory pages\n");
-        free_memory_pages();
-    }
-
+ 
     printk(KERN_ALERT "opening device=%s", MYDEV_NAME);
-
     return 0; /* success */
 }
 
@@ -161,15 +160,17 @@ int asgn2_open(struct inode *inode, struct file *filp) {
  */      
 int asgn2_release (struct inode *inode, struct file *filp) {
   /**
-   * decrement process count
+   * decrement process count, and wake up any process.
    */
     atomic_dec(&asgn2_device.nprocs);
+    wake_up_interruptible(&open_wq); 
     return 0;
 }
 
 
 DECLARE_WAIT_QUEUE_HEAD(consumers_wq);
 DEFINE_MUTEX(read_lock);
+DEFINE_MUTEX(page_lock);
 /**
  * This function reads contents of the virtual disk and writes to the user 
  */
@@ -185,52 +186,58 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 
     size_t size_to_be_read;   /* size to be read in the current round in 
                        while loop */
-    int sess_num;
+    int i;
     //struct list_head *ptr = asgn2_device.mem_list.next;
     page_node *curr;
-
-    if(*f_pos > asgn2_device.data_size) {
-        printk(KERN_ERR "File pointer out of range\n");
-        //mutex_unlock(&read_lock);
-        return 0;
-    }
-
-    wait_event_interruptible_exclusive(consumers_wq, sessions.count > atomic_read(&sessions.curr));
-    if(signal_pending(current)) {
-        return -ERESTARTSYS;
-    }
-
-    atomic_inc(&sessions.curr);
+    page_node *temp;
 
     if(mutex_lock_interruptible(&read_lock)) {
-        printk(KERN_INFO "mutex unlocked by signal\n");
+        printk(KERN_INFO "read mutex unlocked by signal\n");
         mutex_unlock(&read_lock);
         return -EINTR;
     } // returns -EINTR if get signal
 
-    sess_num = atomic_read(&sessions.curr) - 1;
-    printk(KERN_INFO "read is called, request to write %i bytes, start at page =%i, sess_num=%i, fpos=%llu\n", 
-        count, begin_page_no, sess_num, *f_pos);
+    // check to see if its not a repeat read, after already finishing.
+    if(sessions.done > 0 && *f_pos > sessions.ends[sessions.done-1]) {
+        printk(KERN_ERR "File pointer out of range, fpos=%llu, data_size=%i\n", *f_pos, asgn2_device.data_size);
+        mutex_unlock(&read_lock);
+        return 0;
+    }
 
+    // wait until a session is finished, indicated by the lower half of the irq.
+    wait_event_interruptible_exclusive(consumers_wq, sessions.count > sessions.done);
+    if(signal_pending(current)) {
+        printk(KERN_WARNING "consumer wait queue interrupted by system.\n");
+        return -ERESTARTSYS;
+    }
 
-
+    //atomic_inc(&sessions.done);
+  
     if(count > asgn2_device.data_size) {
         printk(KERN_WARNING "Read request excedes device memory\n");
         count = asgn2_device.data_size;
     }
     
-        if(sess_num != 0) {
-        *f_pos = sessions.ends[sess_num-1];
+    if(sessions.done != 0) {
+        *f_pos = sessions.ends[sessions.done-1]; // adjust f_pos to the end of the previous session.
     }
 
-    count = sessions.ends[sess_num] - *f_pos; 
+    /*if(*f_pos > asgn2_device.data_size) {
+        printk(KERN_ERR "File pointer out of range, fpos=%llu, data_size=%i\n", *f_pos, asgn2_device.data_size);
+        return 0;
+    }*/
+
+    count = sessions.ends[sessions.done] - *f_pos; 
     begin_offset = *f_pos % PAGE_SIZE;
+    printk(KERN_ALERT "read is called, request to read %i bytes, start at page =%i, sessions.done=%i, fpos=%llu\n", 
+        count, begin_page_no, sessions.done, *f_pos);
+
 
     printk(KERN_ALERT "begin_offset=%i, count=%i\n", begin_offset, count);
     /*Loop through each page till we hit our first disired page. The size we want to read
       in a given iteration is the minium of the remainig (curr) page, and the total amount left to read.
       Check to se if we have failed to read (size_to_be_read) amount, if so keep going.*/
-    list_for_each_entry(curr, &(asgn2_device.mem_list), list) {
+    list_for_each_entry_safe(curr, temp, &(asgn2_device.mem_list), list) {
         if(curr_page_no >= begin_page_no) {
             //size_to_be_read = min((int)PAGE_SIZE - begin_offset, count - size_read);
             //printk(KERN_INFO "size to be read =%i\n", size_to_be_read);
@@ -238,6 +245,27 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
                 size_to_be_read = min((int)PAGE_SIZE - begin_offset, count - size_read);
                 curr_size_read = size_to_be_read - copy_to_user(buf + size_read, page_address(curr->page) + begin_offset, 
                                     size_to_be_read);
+                
+                if(curr_size_read + begin_offset == PAGE_SIZE) {
+                    if(mutex_lock_interruptible(&page_lock)) {
+                        printk(KERN_INFO "page mutex unlocked by signal\n");
+                        mutex_unlock(&page_lock);
+                        return -EINTR;
+                    } 
+                    printk(KERN_INFO "freeing page.\n");
+                    __free_page(curr->page);
+                    list_del(&curr->list);
+                    kmem_cache_free(asgn2_device.cache, curr); 
+                    
+                    asgn2_device.data_size -= PAGE_SIZE;
+                    asgn2_device.num_pages++;
+                    begin_offset -= PAGE_SIZE;
+                    for(i = sessions.done; i < sessions.count; i++) {
+                        sessions.ends[i] -= PAGE_SIZE;
+                    }
+                    mutex_unlock(&page_lock);
+                }
+                
                 size_read += curr_size_read;
                 size_to_be_read -= curr_size_read;
                 begin_offset += curr_size_read;
@@ -253,6 +281,7 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
         ++curr_page_no;
     }
     *f_pos += size_read + 1;
+    sessions.done++;   
     printk(KERN_ALERT "Read %d bytes", size_read);
     mutex_unlock(&read_lock);
     return size_read;
@@ -285,33 +314,23 @@ int cb_empty(void) {
 
 void asgn2_write(unsigned long pass) {
     size_t begin_offset; 
-    struct list_head *ptr = asgn2_device.mem_list.next;
+    struct list_head *ptr = asgn2_device.mem_list.prev;
     char to_write;
 
     page_node *curr;
     
-    printk(KERN_INFO "write called");
     while (!cb_empty()) {
         to_write = cb_read();
-        
-        if(to_write == '\0') {
-            /* update sessions */
-            sessions.count++;
-            if(sessions.count == 1) {
-                sessions.ends = kmalloc(sizeof(int), GFP_KERNEL);
-            } else {
-                sessions.ends = krealloc(sessions.ends, sizeof(int) * sessions.count, GFP_KERNEL);
-            }
-            sessions.ends[sessions.count-1] = asgn2_device.data_size; // mark end of the session.
-            wake_up_interruptible(&consumers_wq); // completed a session, notify a consumer.
-            continue;
-        }
-
+        if(mutex_lock_interruptible(&page_lock)) {
+            printk(KERN_INFO "page mutex unlocked by signal\n");
+            mutex_unlock(&page_lock);
+            return;
+        } 
         begin_offset = asgn2_device.data_size % PAGE_SIZE; 
 
         curr = list_entry(ptr, page_node, list);
-        if(ptr == &(asgn2_device.mem_list)) {
-            printk(KERN_ALERT "Adding new page to device...\n");
+        if(begin_offset == 0) { //ptr == &(asgn2_device.mem_list)
+            printk(KERN_ALERT "Adding new page to device, deta_size=%i\n", asgn2_device.data_size);
             if((curr = kmem_cache_alloc(asgn2_device.cache, GFP_KERNEL)) == NULL) {
                 printk(KERN_ERR "System has run out of memory\n");
                 return;
@@ -329,7 +348,22 @@ void asgn2_write(unsigned long pass) {
         
         memcpy(page_address(curr->page) + begin_offset, &to_write, 1);
         asgn2_device.data_size += sizeof(to_write);
-        printk(KERN_INFO "wrote %c to page list, data_size=%i", to_write, asgn2_device.data_size);
+
+        mutex_unlock(&page_lock);
+
+        if(to_write == '\0') {
+            /* update sessions */
+            sessions.count++;
+            if(sessions.count == 1) {
+                sessions.ends = kmalloc(sizeof(int), GFP_KERNEL);
+            } else {
+                sessions.ends = krealloc(sessions.ends, sizeof(int) * sessions.count, GFP_KERNEL);
+            }
+            sessions.ends[sessions.count-1] = asgn2_device.data_size; // mark end of the session.
+            wake_up_interruptible(&consumers_wq); // completed a session, notify a consumer.
+            printk(KERN_INFO "Finished session, data_size=%i", asgn2_device.data_size);
+        }
+        //printk(KERN_INFO "wrote %c to page list, data_size=%i", to_write, asgn2_device.data_size);
 
     }
     
