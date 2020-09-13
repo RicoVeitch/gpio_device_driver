@@ -1,0 +1,12 @@
+.asgn1.ko.cmd
+.asgn1.mod.o.cmd
+.asgn1.o.cmd
+gpio_driver.ko
+.gpio_driver.ko.cmd
+gpio_driver.mod.c
+gpio_driver.mod.o
+.gpio_driver.mod.o.cmd
+gpio_driver.o
+.gpio_driver.o.cmd
+modules.order
+Module.symvers
